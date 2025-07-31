@@ -1,34 +1,46 @@
-const { default: makeWASocket, useSingleFileAuthState } = require('@adiwajshing/baileys');
-const { Boom } = require('@hapi/boom');
+const { WAConnection, MessageType, Mimetype } = require('@adiwajshing/baileys');
 const fs = require('fs');
-const P = require('pino');
-const { bugReflect } = require('./bugReflect');
-const { applyShield } = require('./shield');
+const { handleBugReflect } = require('./bugReflect');
+const { handleShield } = require('./shield');
+const { sendMediaMessage } = require('./mediaHandler');
 
-const { state, saveState } = useSingleFileAuthState('./session.json');
+const conn = new WAConnection();
 
-const startSocket = async () => {
-  const sock = makeWASocket({
-    logger: P({ level: 'silent' }),
-    printQRInTerminal: true,
-    auth: state,
-  });
+conn.on('open', () => {
+  const authInfo = conn.base64EncodedAuthInfo();
+  fs.writeFileSync('./session.json', JSON.stringify(authInfo, null, 2));
+  console.log("✅ Session Saved");
+});
 
-  sock.ev.on('creds.update', saveState);
+if (fs.existsSync('./session.json')) {
+  conn.loadAuthInfo('./session.json');
+}
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const m = messages[0];
-    if (!m.message) return;
-    const msgText = m.message.conversation || m.message.extendedTextMessage?.text;
+conn.connect().catch(err => console.error("❌ Connection Failed", err));
 
-    console.log('> Incoming Message:', msgText);
+conn.on('chat-update', async (chat) => {
+  if (!chat.hasNewMessage) return;
+  const m = chat.messages.all()[0];
+  if (!m.message || m.key.fromMe) return;
 
-    // Reflect bugs/spam
-    bugReflect(sock, m);
+  const msgType = Object.keys(m.message)[0];
+  const sender = m.key.remoteJid;
+  const text = m.message.conversation || m.message.extendedTextMessage?.text || "";
 
-    // Apply shield
-    applyShield(sock, m);
-  });
-};
+  // 1. Reflect bugs
+  if (await handleBugReflect(conn, m, text)) return;
 
-startSocket();
+  // 2. Shield protection
+  if (await handleShield(conn, m, text)) return;
+
+  // 3. Media Command: /photo
+  if (text.startsWith('/photo')) {
+    await sendMediaMessage(conn, sender, './media/photo.jpg', 'image');
+  }
+
+  // 4. Echo message
+  if (text.startsWith('/echo ')) {
+    const replyText = text.slice(6);
+    await conn.sendMessage(sender, replyText, MessageType.text);
+  }
+});
